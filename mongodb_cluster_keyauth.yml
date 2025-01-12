@@ -1,0 +1,166 @@
+---
+- name: Install MongoDB and Configure Cluster
+  hosts: mongodb_nodes
+  become: true
+  environment:
+    no_proxy: "localhost,127.0.0.1,localaddress,.localdomain.com"
+  tasks:
+    - name: Download MongoDB repository key locally
+      get_url:
+        url: https://www.mongodb.org/static/pgp/server-7.0.asc
+        dest: /tmp/server-7.0.asc
+        force: yes
+      delegate_to: localhost
+      register: download_result
+
+    - name: Copy MongoDB repository key to MongoDB nodes
+      synchronize:
+        src: /tmp/server-7.0.asc
+        dest: /tmp/server-7.0.asc
+      delegate_to: localhost
+
+    - name: Import MongoDB repository key
+      apt_key:
+        keyring: /tmp/server-7.0.asc
+      when: download_result.changed
+
+    - name: Add MongoDB repository
+      apt_repository:
+        repo: deb [arch=amd64] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/7.0 main
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install MongoDB packages
+      apt:
+        name: mongodb-org
+        state: latest
+
+    - name: Create MongoDB data directory
+      file:
+        path: /mnt/mongodb_data
+        state: directory
+        owner: mongodb
+        group: mongodb
+        mode: "0755"
+
+    - name: Mount MongoDB data directory
+      mount:
+        src: /dev/xvdb
+        path: /mnt/mongodb_data
+        fstype: ext4
+        state: mounted
+        opts: defaults
+
+    - name: Stop MongoDB service
+      service:
+        name: mongod
+        state: stopped
+
+- name: Generate MongoDB keyfile locally
+  hosts: localhost
+  tasks:
+    - name: Generate MongoDB keyfile
+      shell:
+        cmd: "openssl rand -base64 756 > /tmp/mongodb-keyfile"
+        executable: /bin/bash
+      register: keyfile_output
+      failed_when: keyfile_output.rc != 0
+
+- name: Set permissions and ownership for MongoDB keyfile
+  hosts: mongodb_nodes
+  become: true
+  tasks:
+    - name: Copy MongoDB keyfile to nodes and set permissions
+      copy:
+        src: /tmp/mongodb-keyfile
+        dest: /etc/mongodb-keyfile
+        owner: mongodb
+        group: mongodb
+        mode: '0400'
+      ignore_errors: true
+
+
+- name: Backup MongoDB original config file
+  hosts: mongodb_nodes
+  become: true
+  tasks:
+    - name: Create backup of original MongoDB config file
+      command: cp /etc/mongod.conf /etc/mongod.conf.bak
+      args:
+        creates: /etc/mongod.conf.bak
+
+
+
+
+- name: Configure MongoDB Replica Set
+  hosts: mongodb_nodes
+  become: true
+  tasks:
+    - name: Replace MongoDB configuration in a new config file
+      copy:
+        content: |
+          # MongoDB Configuration File
+
+          # Where and how to store data.
+          storage:
+            dbPath: /mnt/mongodb_data
+
+          # Security settings.
+          security:
+            keyFile: /etc/mongodb-keyfile
+            transitionToAuth: true
+
+          # System Log settings.
+          systemLog:
+            destination: file
+            logAppend: true
+            path: /var/log/mongodb/mongod.log
+
+          # Network interfaces.
+          net:
+            port: 27017
+            bindIp: 0.0.0.0
+
+          # Replica Set settings.
+          replication:
+            replSetName: "myReplicaSet"
+
+          # Process Management settings.
+          processManagement:
+            timeZoneInfo: /usr/share/zoneinfo
+        dest: /etc/mongod.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart MongoDB service
+
+  handlers:
+    - name: Restart MongoDB service
+      service:
+        name: mongod
+        state: restarted
+
+- name: Initialize MongoDB replica set and add nodes
+  hosts: "{{ groups['mongodb_nodes'][0] }}"
+  become: true
+  tasks:
+    - name: Initialize replica set
+      command: mongosh --eval 'rs.initiate();'
+
+    - name: Add secondary nodes to the cluster
+      command: mongosh --eval 'rs.add("{{ groups['mongodb_nodes'][1] }}:27017"); rs.add("{{ groups['mongodb_nodes'][2] }}:27017");'
+
+
+- name: Get MongoDB cluster status
+  hosts: mongodb_nodes[0]
+  tasks:
+    - name: Get MongoDB replica set status
+      shell: mongosh --eval 'rs.status()' | grep -E 'set:|_id:|name:|stateStr:' | awk 'BEGIN { RS = "\n\n" } { print }'
+      register: rs_status_output
+
+    - name: Print MongoDB replica set status
+      debug:
+        msg: "{{ rs_status_output.stdout }}"
